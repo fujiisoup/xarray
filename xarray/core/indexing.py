@@ -409,8 +409,8 @@ class MemoryCachedArray(utils.NDArrayMixin, NDArrayIndexable):
         self.array = _wrap_numpy_scalars(as_indexable(array))
 
     def _ensure_cached(self):
-        if not isinstance(self.array, np.ndarray):
-            self.array = np.asarray(self.array)
+        if not isinstance(self.array, NumpyIndexingAdapter):
+            self.array = NumpyIndexingAdapter(np.asarray(self.array))
 
     def __array__(self, dtype=None):
         self._ensure_cached()

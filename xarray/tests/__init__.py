@@ -8,20 +8,22 @@ import re
 import importlib
 
 import numpy as np
-from numpy.testing import assert_array_equal
+from numpy.testing import assert_array_equal  # noqa: F401
 from xarray.core.duck_array_ops import allclose_or_equiv
 import pytest
 
 from xarray.core import utils
 from xarray.core.pycompat import PY3
-from xarray.testing import assert_equal, assert_identical, assert_allclose
+from xarray.core.indexing import ExplicitlyIndexed
+from xarray.testing import (assert_equal, assert_identical,  # noqa: F401
+                            assert_allclose)
 from xarray.plot.utils import import_seaborn
 
 try:
     from pandas.testing import assert_frame_equal
 except ImportError:
     # old location, for pandas < 0.20
-    from pandas.util.testing import assert_frame_equal
+    from pandas.util.testing import assert_frame_equal  # noqa: F401
 
 try:
     import unittest2 as unittest
@@ -31,7 +33,7 @@ except ImportError:
 try:
     from unittest import mock
 except ImportError:
-    import mock
+    import mock  # noqa: F401
 
 # import mpl and change the backend before other mpl imports
 try:
@@ -52,40 +54,50 @@ def _importorskip(modname, minversion=None):
                 raise ImportError('Minimum version not satisfied')
     except ImportError:
         has = False
-    # TODO: use pytest.skipif instead of unittest.skipUnless
-    # Using `unittest.skipUnless` is a temporary workaround for pytest#568,
-    # wherein class decorators stain inherited classes.
-    # xref: xarray#1531, implemented in xarray #1557.
-    func = unittest.skipUnless(has, reason='requires {}'.format(modname))
+    func = pytest.mark.skipif(not has, reason='requires {}'.format(modname))
     return has, func
 
 
 has_matplotlib, requires_matplotlib = _importorskip('matplotlib')
+has_matplotlib2, requires_matplotlib2 = _importorskip('matplotlib',
+                                                      minversion='2')
 has_scipy, requires_scipy = _importorskip('scipy')
 has_pydap, requires_pydap = _importorskip('pydap.client')
 has_netCDF4, requires_netCDF4 = _importorskip('netCDF4')
 has_h5netcdf, requires_h5netcdf = _importorskip('h5netcdf')
 has_pynio, requires_pynio = _importorskip('Nio')
+has_pseudonetcdf, requires_pseudonetcdf = _importorskip('PseudoNetCDF')
+has_cftime, requires_cftime = _importorskip('cftime')
 has_dask, requires_dask = _importorskip('dask')
 has_bottleneck, requires_bottleneck = _importorskip('bottleneck')
 has_rasterio, requires_rasterio = _importorskip('rasterio')
 has_pathlib, requires_pathlib = _importorskip('pathlib')
+has_zarr, requires_zarr = _importorskip('zarr', minversion='2.2')
+has_np113, requires_np113 = _importorskip('numpy', minversion='1.13.0')
+has_iris, requires_iris = _importorskip('iris')
 
 # some special cases
 has_scipy_or_netCDF4 = has_scipy or has_netCDF4
-requires_scipy_or_netCDF4 = unittest.skipUnless(
-    has_scipy_or_netCDF4, reason='requires scipy or netCDF4')
+requires_scipy_or_netCDF4 = pytest.mark.skipif(
+    not has_scipy_or_netCDF4, reason='requires scipy or netCDF4')
+has_cftime_or_netCDF4 = has_cftime or has_netCDF4
+requires_cftime_or_netCDF4 = pytest.mark.skipif(
+    not has_cftime_or_netCDF4, reason='requires cftime or netCDF4')
 if not has_pathlib:
     has_pathlib, requires_pathlib = _importorskip('pathlib2')
 if has_dask:
     import dask
-    dask.set_options(get=dask.get)
+    if LooseVersion(dask.__version__) < '0.18':
+        dask.set_options(get=dask.get)
+    else:
+        dask.config.set(scheduler='sync')
 try:
     import_seaborn()
     has_seaborn = True
-except:
+except ImportError:
     has_seaborn = False
-requires_seaborn = unittest.skipUnless(has_seaborn, reason='requires seaborn')
+requires_seaborn = pytest.mark.skipif(not has_seaborn,
+                                      reason='requires seaborn')
 
 try:
     _SKIP_FLAKY = not pytest.config.getoption("--run-flaky")
@@ -106,6 +118,9 @@ network = pytest.mark.skipif(
 
 
 class TestCase(unittest.TestCase):
+    """
+    These functions are all deprecated. Instead, use functions in xr.testing
+    """
     if PY3:
         # Python 3 assertCountEqual is roughly equivalent to Python 2
         # assertItemsEqual
@@ -122,25 +137,9 @@ class TestCase(unittest.TestCase):
         assert len(w) > 0
         assert any(message in str(wi.message) for wi in w)
 
-    def assertVariableEqual(self, v1, v2):
-        __tracebackhide__ = True  # noqa: F841
-        assert_equal(v1, v2)
-
-    def assertVariableIdentical(self, v1, v2):
-        __tracebackhide__ = True  # noqa: F841
-        assert_identical(v1, v2)
-
-    def assertVariableAllClose(self, v1, v2, rtol=1e-05, atol=1e-08):
-        __tracebackhide__ = True  # noqa: F841
-        assert_allclose(v1, v2, rtol=rtol, atol=atol)
-
     def assertVariableNotEqual(self, v1, v2):
         __tracebackhide__ = True  # noqa: F841
         assert not v1.equals(v2)
-
-    def assertArrayEqual(self, a1, a2):
-        __tracebackhide__ = True  # noqa: F841
-        assert_array_equal(a1, a2)
 
     def assertEqual(self, a1, a2):
         __tracebackhide__ = True  # noqa: F841
@@ -149,38 +148,6 @@ class TestCase(unittest.TestCase):
     def assertAllClose(self, a1, a2, rtol=1e-05, atol=1e-8):
         __tracebackhide__ = True  # noqa: F841
         assert allclose_or_equiv(a1, a2, rtol=rtol, atol=atol)
-
-    def assertDatasetEqual(self, d1, d2):
-        __tracebackhide__ = True  # noqa: F841
-        assert_equal(d1, d2)
-
-    def assertDatasetIdentical(self, d1, d2):
-        __tracebackhide__ = True  # noqa: F841
-        assert_identical(d1, d2)
-
-    def assertDatasetAllClose(self, d1, d2, rtol=1e-05, atol=1e-08,
-                              decode_bytes=True):
-        __tracebackhide__ = True  # noqa: F841
-        assert_allclose(d1, d2, rtol=rtol, atol=atol,
-                        decode_bytes=decode_bytes)
-
-    def assertCoordinatesEqual(self, d1, d2):
-        __tracebackhide__ = True  # noqa: F841
-        assert_equal(d1, d2)
-
-    def assertDataArrayEqual(self, ar1, ar2):
-        __tracebackhide__ = True  # noqa: F841
-        assert_equal(ar1, ar2)
-
-    def assertDataArrayIdentical(self, ar1, ar2):
-        __tracebackhide__ = True  # noqa: F841
-        assert_identical(ar1, ar2)
-
-    def assertDataArrayAllClose(self, ar1, ar2, rtol=1e-05, atol=1e-08,
-                                decode_bytes=True):
-        __tracebackhide__ = True  # noqa: F841
-        assert_allclose(ar1, ar2, rtol=rtol, atol=atol,
-                        decode_bytes=decode_bytes)
 
 
 @contextmanager
@@ -198,7 +165,7 @@ class UnexpectedDataAccess(Exception):
     pass
 
 
-class InaccessibleArray(utils.NDArrayMixin):
+class InaccessibleArray(utils.NDArrayMixin, ExplicitlyIndexed):
 
     def __init__(self, array):
         self.array = array
@@ -213,11 +180,25 @@ class ReturnItem(object):
         return key
 
 
+class IndexerMaker(object):
+
+    def __init__(self, indexer_cls):
+        self._indexer_cls = indexer_cls
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        return self._indexer_cls(key)
+
+
 def source_ndarray(array):
     """Given an ndarray, return the base object which holds its memory, or the
     object itself.
     """
-    base = getattr(array, 'base', np.asarray(array).base)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', 'DatetimeIndex.base')
+        warnings.filterwarnings('ignore', 'TimedeltaIndex.base')
+        base = getattr(array, 'base', np.asarray(array).base)
     if base is None:
         base = array
     return base

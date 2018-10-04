@@ -1,15 +1,20 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+from __future__ import absolute_import, division, print_function
+
 from collections import Mapping
 from contextlib import contextmanager
+
 import pandas as pd
 
-from . import formatting
-from .utils import Frozen
+from . import formatting, indexing
 from .merge import (
-    merge_coords, expand_and_merge_variables, merge_coords_for_inplace_math)
+    expand_and_merge_variables, merge_coords, merge_coords_for_inplace_math)
 from .pycompat import OrderedDict
+from .utils import Frozen, ReprObject, either_dict_or_kwargs
+from .variable import Variable
+
+# Used as the key corresponding to a DataArray's variable when converting
+# arbitrary DataArray objects to datasets
+_THIS_ARRAY = ReprObject('<this-array>')
 
 
 class AbstractCoordinates(Mapping, formatting.ReprMixin):
@@ -106,7 +111,7 @@ class AbstractCoordinates(Mapping, formatting.ReprMixin):
             # don't include indexes in priority_vars, because we didn't align
             # first
             priority_vars = OrderedDict(
-                (k, v) for k, v in self.variables.items() if k not in self.dims)
+                kv for kv in self.variables.items() if kv[0] not in self.dims)
             variables = merge_coords_for_inplace_math(
                 [self.variables, other.variables], priority_vars=priority_vars)
             yield
@@ -151,6 +156,7 @@ class DatasetCoordinates(AbstractCoordinates):
     dimensions and the values given by the corresponding xarray.Coordinate
     objects.
     """
+
     def __init__(self, dataset):
         self._data = dataset
 
@@ -209,6 +215,7 @@ class DataArrayCoordinates(AbstractCoordinates):
     Essentially an OrderedDict with keys given by the array's
     dimensions and the values given by corresponding DataArray objects.
     """
+
     def __init__(self, dataarray):
         self._data = dataarray
 
@@ -222,7 +229,9 @@ class DataArrayCoordinates(AbstractCoordinates):
     def _update_coords(self, coords):
         from .dataset import calculate_dimensions
 
-        dims = calculate_dimensions(coords)
+        coords_plus_data = coords.copy()
+        coords_plus_data[_THIS_ARRAY] = self._data.variable
+        dims = calculate_dimensions(coords_plus_data)
         if not set(dims) <= set(self.dims):
             raise ValueError('cannot add coordinates with new dimensions to '
                              'a DataArray')
@@ -255,6 +264,7 @@ class LevelCoordinatesSource(object):
     Used for attribute style lookup with AttrAccessMixin. Not returned directly
     by any public methods.
     """
+
     def __init__(self, data_object):
         self._data = data_object
 
@@ -269,11 +279,12 @@ class LevelCoordinatesSource(object):
 class Indexes(Mapping, formatting.ReprMixin):
     """Ordered Mapping[str, pandas.Index] for xarray objects.
     """
+
     def __init__(self, variables, sizes):
         """Not for public consumption.
 
-        Arguments
-        ---------
+        Parameters
+        ----------
         variables : OrderedDict[Any, Variable]
             Reference to OrderedDict holding variable objects. Should be the
             same dictionary used by the source object.
@@ -301,3 +312,57 @@ class Indexes(Mapping, formatting.ReprMixin):
 
     def __unicode__(self):
         return formatting.indexes_repr(self)
+
+
+def assert_coordinate_consistent(obj, coords):
+    """ Maeke sure the dimension coordinate of obj is
+    consistent with coords.
+
+    obj: DataArray or Dataset
+    coords: Dict-like of variables
+    """
+    for k in obj.dims:
+        # make sure there are no conflict in dimension coordinates
+        if k in coords and k in obj.coords:
+            if not coords[k].equals(obj[k].variable):
+                raise IndexError(
+                    'dimension coordinate {!r} conflicts between '
+                    'indexed and indexing objects:\n{}\nvs.\n{}'
+                    .format(k, obj[k], coords[k]))
+
+
+def remap_label_indexers(obj, indexers=None, method=None, tolerance=None,
+                         **indexers_kwargs):
+    """
+    Remap **indexers from obj.coords.
+    If indexer is an instance of DataArray and it has coordinate, then this
+    coordinate will be attached to pos_indexers.
+
+    Returns
+    -------
+    pos_indexers: Same type of indexers.
+        np.ndarray or Variable or DataArra
+    new_indexes: mapping of new dimensional-coordinate.
+    """
+    from .dataarray import DataArray
+    indexers = either_dict_or_kwargs(
+        indexers, indexers_kwargs, 'remap_label_indexers')
+
+    v_indexers = {k: v.variable.data if isinstance(v, DataArray) else v
+                  for k, v in indexers.items()}
+
+    pos_indexers, new_indexes = indexing.remap_label_indexers(
+        obj, v_indexers, method=method, tolerance=tolerance
+    )
+    # attach indexer's coordinate to pos_indexers
+    for k, v in indexers.items():
+        if isinstance(v, Variable):
+            pos_indexers[k] = Variable(v.dims, pos_indexers[k])
+        elif isinstance(v, DataArray):
+            # drop coordinates found in indexers since .sel() already
+            # ensures alignments
+            coords = OrderedDict((k, v) for k, v in v._coords.items()
+                                 if k not in indexers)
+            pos_indexers[k] = DataArray(pos_indexers[k],
+                                        coords=coords, dims=v.dims)
+    return pos_indexers, new_indexes

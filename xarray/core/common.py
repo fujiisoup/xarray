@@ -1,15 +1,20 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+from __future__ import absolute_import, division, print_function
+
+import warnings
+from distutils.version import LooseVersion
+from textwrap import dedent
+
 import numpy as np
 import pandas as pd
-import warnings
 
-from .pycompat import basestring, suppress, dask_array_type, OrderedDict
-from . import dtypes
-from . import formatting
-from . import ops
-from .utils import SortedKeysDict, not_implemented, Frozen
+from . import duck_array_ops, dtypes, formatting, ops
+from .arithmetic import SupportsArithmetic
+from .pycompat import OrderedDict, basestring, dask_array_type, suppress
+from .utils import either_dict_or_kwargs, Frozen, SortedKeysDict, ReprObject
+
+
+# Used as a sentinel value to indicate a all dimensions
+ALL_DIMS = ReprObject('<all-dims>')
 
 
 class ImplementsArrayReduce(object):
@@ -27,20 +32,20 @@ class ImplementsArrayReduce(object):
                                    allow_lazy=True, **kwargs)
         return wrapped_func
 
-    _reduce_extra_args_docstring = \
-        """dim : str or sequence of str, optional
+    _reduce_extra_args_docstring = dedent("""\
+        dim : str or sequence of str, optional
             Dimension(s) over which to apply `{name}`.
         axis : int or sequence of int, optional
             Axis(es) over which to apply `{name}`. Only one of the 'dim'
             and 'axis' arguments can be supplied. If neither are supplied, then
-            `{name}` is calculated over axes."""
+            `{name}` is calculated over axes.""")
 
-    _cum_extra_args_docstring = \
-        """dim : str or sequence of str, optional
+    _cum_extra_args_docstring = dedent("""\
+        dim : str or sequence of str, optional
             Dimension over which to apply `{name}`.
         axis : int or sequence of int, optional
             Axis over which to apply `{name}`. Only one of the 'dim'
-            and 'axis' arguments can be supplied."""
+            and 'axis' arguments can be supplied.""")
 
 
 class ImplementsDatasetReduce(object):
@@ -91,7 +96,7 @@ class AbstractArray(ImplementsArrayReduce, formatting.ReprMixin):
         return complex(self.values)
 
     def __long__(self):
-        return long(self.values)
+        return long(self.values)  # flake8: noqa
 
     def __array__(self, dtype=None):
         return np.asarray(self.values, dtype=dtype)
@@ -211,24 +216,36 @@ class AttrAccessMixin(object):
         return list(set(item_lists))
 
 
-def get_squeeze_dims(xarray_obj, dim):
+def get_squeeze_dims(xarray_obj, dim, axis=None):
     """Get a list of dimensions to squeeze out.
     """
-    if dim is None:
+    if dim is not None and axis is not None:
+        raise ValueError('cannot use both parameters `axis` and `dim`')
+
+    if dim is None and axis is None:
         dim = [d for d, s in xarray_obj.sizes.items() if s == 1]
     else:
         if isinstance(dim, basestring):
             dim = [dim]
+        if isinstance(axis, int):
+            axis = (axis, )
+        if isinstance(axis, tuple):
+            for a in axis:
+                if not isinstance(a, int):
+                    raise ValueError(
+                        'parameter `axis` must be int or tuple of int.')
+            alldims = list(xarray_obj.sizes.keys())
+            dim = [alldims[a] for a in axis]
         if any(xarray_obj.sizes[k] > 1 for k in dim):
             raise ValueError('cannot select a dimension to squeeze out '
                              'which has length greater than one')
     return dim
 
 
-class BaseDataObject(AttrAccessMixin):
+class DataWithCoords(SupportsArithmetic, AttrAccessMixin):
     """Shared base class for Dataset and DataArray."""
 
-    def squeeze(self, dim=None, drop=False):
+    def squeeze(self, dim=None, drop=False, axis=None):
         """Return a new object with squeezed data.
 
         Parameters
@@ -240,6 +257,8 @@ class BaseDataObject(AttrAccessMixin):
         drop : bool, optional
             If ``drop=True``, drop squeezed coordinates instead of making them
             scalar.
+        axis : int, optional
+            Select the dimension to squeeze. Added for compatibility reasons.
 
         Returns
         -------
@@ -251,7 +270,7 @@ class BaseDataObject(AttrAccessMixin):
         --------
         numpy.squeeze
         """
-        dims = get_squeeze_dims(self, dim)
+        dims = get_squeeze_dims(self, dim, axis)
         return self.isel(drop=drop, **{d: 0 for d in dims})
 
     def get_index(self, key):
@@ -294,6 +313,25 @@ class BaseDataObject(AttrAccessMixin):
         assigned : same type as caller
             A new object with the new coordinates in addition to the existing
             data.
+
+        Examples
+        --------
+
+        Convert longitude coordinates from 0-359 to -180-179:
+
+        >>> da = xr.DataArray(np.random.rand(4),
+        ...                   coords=[np.array([358, 359, 0, 1])],
+        ...                   dims='lon')
+        >>> da
+        <xarray.DataArray (lon: 4)>
+        array([0.28298 , 0.667347, 0.657938, 0.177683])
+        Coordinates:
+          * lon      (lon) int64 358 359 0 1
+        >>> da.assign_coords(lon=(((da.lon + 180) % 360) - 180))
+        <xarray.DataArray (lon: 4)>
+        array([0.28298 , 0.667347, 0.657938, 0.177683])
+        Coordinates:
+          * lon      (lon) int64 -2 -1 0 1
 
         Notes
         -----
@@ -412,6 +450,31 @@ class BaseDataObject(AttrAccessMixin):
         grouped : GroupBy
             A `GroupBy` object patterned after `pandas.GroupBy` that can be
             iterated over in the form of `(unique_value, grouped_array)` pairs.
+
+        Examples
+        --------
+        Calculate daily anomalies for daily data:
+
+        >>> da = xr.DataArray(np.linspace(0, 1826, num=1827),
+        ...                   coords=[pd.date_range('1/1/2000', '31/12/2004',
+        ...                           freq='D')],
+        ...                   dims='time')
+        >>> da
+        <xarray.DataArray (time: 1827)>
+        array([0.000e+00, 1.000e+00, 2.000e+00, ..., 1.824e+03, 1.825e+03, 1.826e+03])
+        Coordinates:
+          * time     (time) datetime64[ns] 2000-01-01 2000-01-02 2000-01-03 ...
+        >>> da.groupby('time.dayofyear') - da.groupby('time.dayofyear').mean('time')
+        <xarray.DataArray (time: 1827)>
+        array([-730.8, -730.8, -730.8, ...,  730.2,  730.2,  730.5])
+        Coordinates:
+          * time       (time) datetime64[ns] 2000-01-01 2000-01-02 2000-01-03 ...
+            dayofyear  (time) int64 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 ...
+
+        See Also
+        --------
+        core.groupby.DataArrayGroupBy
+        core.groupby.DatasetGroupBy
         """
         return self._groupby_cls(self, group, squeeze=squeeze)
 
@@ -467,37 +530,35 @@ class BaseDataObject(AttrAccessMixin):
                                              'precision': precision,
                                              'include_lowest': include_lowest})
 
-    def rolling(self, min_periods=None, center=False, **windows):
+    def rolling(self, dim=None, min_periods=None, center=False, **dim_kwargs):
         """
         Rolling window object.
 
-        Rolling window aggregations are much faster when bottleneck is
-        installed.
-
         Parameters
         ----------
+        dim: dict, optional
+            Mapping from the dimension name to create the rolling iterator
+            along (e.g. `time`) to its moving window size.
         min_periods : int, default None
             Minimum number of observations in window required to have a value
             (otherwise result is NA). The default, None, is equivalent to
             setting min_periods equal to the size of the window.
         center : boolean, default False
             Set the labels at the center of the window.
-        **windows : dim=window
-            dim : str
-                Name of the dimension to create the rolling iterator
-                along (e.g., `time`).
-            window : int
-                Size of the moving window.
+        **dim_kwargs : optional
+            The keyword arguments form of ``dim``.
+            One of dim or dim_kwarg must be provided.
 
         Returns
         -------
-        rolling : type of input argument
+        Rolling object (core.rolling.DataArrayRolling for DataArray,
+        core.rolling.DatasetRolling for Dataset.)
 
         Examples
         --------
         Create rolling seasonal average of monthly data e.g. DJF, JFM, ..., SON:
 
-        >>> da = xr.DataArray(np.linspace(0,11,num=12),
+        >>> da = xr.DataArray(np.linspace(0, 11, num=12),
         ...                   coords=[pd.date_range('15/12/1999',
         ...                           periods=12, freq=pd.DateOffset(months=1))],
         ...                   dims='time')
@@ -506,31 +567,35 @@ class BaseDataObject(AttrAccessMixin):
         array([  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7., 8.,   9.,  10.,  11.])
         Coordinates:
           * time     (time) datetime64[ns] 1999-12-15 2000-01-15 2000-02-15 ...
-        >>> da.rolling(time=3).mean()
+        >>> da.rolling(time=3, center=True).mean()
         <xarray.DataArray (time: 12)>
-        array([ nan,  nan,   1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.])
+        array([nan,  1.,  2.,  3.,  4.,  5.,  6.,  7.,  8.,  9., 10., nan])
         Coordinates:
           * time     (time) datetime64[ns] 1999-12-15 2000-01-15 2000-02-15 ...
 
         Remove the NaNs using ``dropna()``:
 
-        >>> da.rolling(time=3).mean().dropna('time')
+        >>> da.rolling(time=3, center=True).mean().dropna('time')
         <xarray.DataArray (time: 10)>
-        array([  1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.])
+        array([ 1.,  2.,  3.,  4.,  5.,  6.,  7.,  8.,  9., 10.])
         Coordinates:
-          * time     (time) datetime64[ns] 2000-02-15 2000-03-15 2000-04-15 ...
-        """
+          * time     (time) datetime64[ns] 2000-01-15 2000-02-15 2000-03-15 ...
 
-        return self._rolling_cls(self, min_periods=min_periods,
-                                 center=center, **windows)
+        See Also
+        --------
+        core.rolling.DataArrayRolling
+        core.rolling.DatasetRolling
+        """
+        dim = either_dict_or_kwargs(dim, dim_kwargs, 'rolling')
+        return self._rolling_cls(self, dim, min_periods=min_periods,
+                                 center=center)
 
     def resample(self, freq=None, dim=None, how=None, skipna=None,
                  closed=None, label=None, base=0, keep_attrs=False, **indexer):
         """Returns a Resample object for performing resampling operations.
 
-        Handles both downsampling and upsampling. Upsampling with filling is
-        not supported; if any intervals contain no values from the original
-        object, they will be given the value ``NaN``.
+        Handles both downsampling and upsampling. If any intervals contain no
+        values from the original object, they will be given the value ``NaN``.
 
         Parameters
         ----------
@@ -557,11 +622,40 @@ class BaseDataObject(AttrAccessMixin):
         resampled : same type as caller
             This object resampled.
 
+        Examples
+        --------
+        Downsample monthly time-series data to seasonal data:
+
+        >>> da = xr.DataArray(np.linspace(0, 11, num=12),
+        ...                   coords=[pd.date_range('15/12/1999',
+        ...                           periods=12, freq=pd.DateOffset(months=1))],
+        ...                   dims='time')
+        >>> da
+        <xarray.DataArray (time: 12)>
+        array([  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7., 8.,   9.,  10.,  11.])
+        Coordinates:
+          * time     (time) datetime64[ns] 1999-12-15 2000-01-15 2000-02-15 ...
+        >>> da.resample(time="QS-DEC").mean()
+        <xarray.DataArray (time: 4)>
+        array([ 1.,  4.,  7., 10.])
+        Coordinates:
+          * time     (time) datetime64[ns] 1999-12-01 2000-03-01 2000-06-01 2000-09-01
+
+        Upsample monthly time-series data to daily data:
+
+        >>> da.resample(time='1D').interpolate('linear')
+        <xarray.DataArray (time: 337)>
+        array([ 0.      ,  0.032258,  0.064516, ..., 10.935484, 10.967742, 11.      ])
+        Coordinates:
+          * time     (time) datetime64[ns] 1999-12-15 1999-12-16 1999-12-17 ...
+
         References
         ----------
 
         .. [1] http://pandas.pydata.org/pandas-docs/stable/timeseries.html#offset-aliases
         """
+        # TODO support non-string indexer after removing the old API.
+
         from .dataarray import DataArray
         from .resample import RESAMPLE_DIM
 
@@ -590,10 +684,9 @@ class BaseDataObject(AttrAccessMixin):
             raise TypeError("Dimension name should be a string; "
                             "was passed %r" % dim)
         group = DataArray(dim, [(dim.dims, dim)], name=RESAMPLE_DIM)
-        time_grouper = pd.TimeGrouper(freq=freq, closed=closed,
-                                      label=label, base=base)
+        grouper = pd.Grouper(freq=freq, closed=closed, label=label, base=base)
         resampler = self._resample_cls(self, group=group, dim=dim_name,
-                                       grouper=time_grouper,
+                                       grouper=grouper,
                                        resample_dim=RESAMPLE_DIM)
 
         return resampler
@@ -607,17 +700,17 @@ class BaseDataObject(AttrAccessMixin):
 
         warnings.warn("\n.resample() has been modified to defer "
                       "calculations. Instead of passing 'dim' and "
-                      "'how=\"{how}\", instead consider using "
-                      ".resample({dim}=\"{freq}\").{how}() ".format(
-                            dim=dim, freq=freq, how=how
-                      ), DeprecationWarning, stacklevel=3)
+                      "how=\"{how}\", instead consider using "
+                      ".resample({dim}=\"{freq}\").{how}('{dim}') ".format(
+                      dim=dim, freq=freq, how=how),
+                      FutureWarning, stacklevel=3)
 
         if isinstance(dim, basestring):
             dim = self[dim]
         group = DataArray(dim, [(dim.dims, dim)], name=RESAMPLE_DIM)
-        time_grouper = pd.TimeGrouper(freq=freq, how=how, closed=closed,
-                                      label=label, base=base)
-        gb = self._groupby_cls(self, group, grouper=time_grouper)
+        grouper = pd.Grouper(freq=freq, how=how, closed=closed, label=label,
+                             base=base)
+        gb = self._groupby_cls(self, group, grouper=grouper)
         if isinstance(how, basestring):
             f = getattr(gb, how)
             if how in ['first', 'last']:
@@ -724,17 +817,60 @@ class BaseDataObject(AttrAccessMixin):
             self._file_obj.close()
         self._file_obj = None
 
+    def isin(self, test_elements):
+        """Tests each value in the array for whether it is in the supplied list.
+
+        Parameters
+        ----------
+        test_elements : array_like
+            The values against which to test each value of `element`.
+            This argument is flattened if an array or array_like.
+            See numpy notes for behavior with non-array-like parameters.
+
+        Returns
+        -------
+        isin : same as object, bool
+            Has the same shape as this object.
+
+        Examples
+        --------
+
+        >>> array = xr.DataArray([1, 2, 3], dims='x')
+        >>> array.isin([1, 3])
+        <xarray.DataArray (x: 3)>
+        array([ True, False,  True])
+        Dimensions without coordinates: x
+
+        See also
+        --------
+        numpy.isin
+        """
+        from .computation import apply_ufunc
+        from .dataset import Dataset
+        from .dataarray import DataArray
+        from .variable import Variable
+
+        if isinstance(test_elements, Dataset):
+            raise TypeError(
+                'isin() argument must be convertible to an array: {}'
+                .format(test_elements))
+        elif isinstance(test_elements, (Variable, DataArray)):
+            # need to explicitly pull out data to support dask arrays as the
+            # second argument
+            test_elements = test_elements.data
+
+        return apply_ufunc(
+            duck_array_ops.isin,
+            self,
+            kwargs=dict(test_elements=test_elements),
+            dask='allowed',
+        )
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
-
-    # this has no runtime function - these are listed so IDEs know these
-    # methods are defined and don't warn on these operations
-    __lt__ = __le__ = __ge__ = __gt__ = __add__ = __sub__ = __mul__ = \
-        __truediv__ = __floordiv__ = __mod__ = __pow__ = __and__ = __xor__ = \
-        __or__ = __div__ = __eq__ = __ne__ = not_implemented
 
 
 def full_like(other, fill_value, dtype=None):
@@ -804,3 +940,34 @@ def ones_like(other, dtype=None):
     """Shorthand for full_like(other, 1, dtype)
     """
     return full_like(other, 1, dtype)
+
+
+def is_np_datetime_like(dtype):
+    """Check if a dtype is a subclass of the numpy datetime types
+    """
+    return (np.issubdtype(dtype, np.datetime64) or
+            np.issubdtype(dtype, np.timedelta64))
+
+
+def contains_cftime_datetimes(var):
+    """Check if a variable contains cftime datetime objects"""
+    try:
+        from cftime import datetime as cftime_datetime
+    except ImportError:
+        return False
+    else:
+        if var.dtype == np.dtype('O') and var.data.size > 0:
+            sample = var.data.ravel()[0]
+            if isinstance(sample, dask_array_type):
+                sample = sample.compute()
+                if isinstance(sample, np.ndarray):
+                    sample = sample.item()
+            return isinstance(sample, cftime_datetime)
+        else:
+            return False
+
+
+def _contains_datetime_like_objects(var):
+    """Check if a variable contains datetime like objects (either
+    np.datetime64, np.timedelta64, or cftime.datetime)"""
+    return is_np_datetime_like(var.dtype) or contains_cftime_datetimes(var)

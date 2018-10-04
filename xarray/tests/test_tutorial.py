@@ -1,14 +1,11 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+from __future__ import absolute_import, division, print_function
 
 import os
-import pytest
 
-from xarray import tutorial, DataArray
+from xarray import DataArray, tutorial
 from xarray.core.pycompat import suppress
 
-from . import TestCase, network
+from . import TestCase, assert_identical, network
 
 
 @network
@@ -26,4 +23,4 @@ class TestLoadDataset(TestCase):
     def test_download_from_github(self):
         ds = tutorial.load_dataset(self.testfile)
         tiny = DataArray(range(5), name='tiny').to_dataset()
-        self.assertDatasetIdentical(ds, tiny)
+        assert_identical(ds, tiny)

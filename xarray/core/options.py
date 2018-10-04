@@ -1,11 +1,11 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
+from __future__ import absolute_import, division, print_function
 
 OPTIONS = {
     'display_width': 80,
     'arithmetic_join': 'inner',
+    'enable_cftimeindex': False,
+    'cmap_sequential': 'viridis',
+    'cmap_divergent': 'RdBu_r',
 }
 
 
@@ -18,6 +18,16 @@ class set_options(object):
       Default: ``80``.
     - ``arithmetic_join``: DataArray/Dataset alignment in binary operations.
       Default: ``'inner'``.
+    - ``enable_cftimeindex``: flag to enable using a ``CFTimeIndex``
+      for time indexes with non-standard calendars or dates outside the
+      Timestamp-valid range. Default: ``False``.
+    - ``cmap_sequential``: colormap to use for nondivergent data plots.
+      Default: ``viridis``. If string, must be matplotlib built-in colormap.
+      Can also be a Colormap object (e.g. mpl.cm.magma)
+    - ``cmap_divergent``: colormap to use for divergent data plots.
+      Default: ``RdBu_r``. If string, must be matplotlib built-in colormap.
+      Can also be a Colormap object (e.g. mpl.cm.magma)
+
 
     You can use ``set_options`` either as a context manager:
 
@@ -35,6 +45,7 @@ class set_options(object):
 
     >>> xr.set_options(display_width=80)
     """
+
     def __init__(self, **kwargs):
         invalid_options = {k for k in kwargs if k not in OPTIONS}
         if invalid_options:

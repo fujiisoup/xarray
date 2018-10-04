@@ -8,7 +8,6 @@ dependencies:
   - h5py
   - h5netcdf
   - matplotlib
-  - netcdf4
   - pathlib2
   - pytest
   - flake8
@@ -19,3 +18,6 @@ dependencies:
   - seaborn
   - toolz
   - rasterio
+  - zarr
+  - pip:
+    - netcdf4

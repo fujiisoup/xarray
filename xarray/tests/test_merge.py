@@ -1,15 +1,13 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-import numpy as np
-import xarray as xr
+from __future__ import absolute_import, division, print_function
 
+import numpy as np
 import pytest
+
+import xarray as xr
+from xarray.core import merge
 
 from . import TestCase, raises_regex
 from .test_dataset import create_test_data
-
-from xarray.core import merge
 
 
 class TestMergeInternals(TestCase):
@@ -76,9 +74,9 @@ class TestMergeFunction(TestCase):
         ds2 = xr.Dataset({'a': ('x', [2, 3]), 'x': [1, 2]})
         expected = xr.Dataset({'a': ('x', [1, 2, 3]), 'x': [0, 1, 2]})
         assert expected.identical(xr.merge([ds1, ds2],
-                                  compat='no_conflicts'))
+                                           compat='no_conflicts'))
         assert expected.identical(xr.merge([ds2, ds1],
-                                  compat='no_conflicts'))
+                                           compat='no_conflicts'))
         assert ds1.identical(xr.merge([ds1, ds2],
                                       compat='no_conflicts',
                                       join='left'))

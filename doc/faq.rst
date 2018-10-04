@@ -1,5 +1,15 @@
+.. _faq:
+
 Frequently Asked Questions
 ==========================
+
+.. ipython:: python
+   :suppress:
+
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+    np.random.seed(123456)
 
 Why is pandas not enough?
 -------------------------
@@ -58,6 +68,38 @@ fundamentally multi-dimensional. If your data is unstructured or
 one-dimensional, stick with pandas.
 
 
+Why don't aggregations return Python scalars?
+---------------------------------------------
+
+xarray tries hard to be self-consistent: operations on a ``DataArray`` (resp.
+``Dataset``) return another ``DataArray`` (resp. ``Dataset``) object. In
+particular, operations returning scalar values (e.g. indexing or aggregations
+like ``mean`` or ``sum`` applied to all axes) will also return xarray objects.
+
+Unfortunately, this means we sometimes have to explicitly cast our results from
+xarray when using them in other libraries. As an illustration, the following
+code fragment
+
+.. ipython:: python
+
+    arr = xr.DataArray([1, 2, 3])
+    pd.Series({'x': arr[0], 'mean': arr.mean(), 'std': arr.std()})
+
+does not yield the pandas DataFrame we expected. We need to specify the type
+conversion ourselves:
+
+.. ipython:: python
+
+    pd.Series({'x': arr[0], 'mean': arr.mean(), 'std': arr.std()}, dtype=float)
+
+Alternatively, we could use the ``item`` method or the ``float`` constructor to
+convert values one at a time
+
+.. ipython:: python
+
+    pd.Series({'x': arr[0].item(), 'mean': float(arr.mean())})
+
+
 .. _approach to metadata:
 
 What is your approach to metadata?
@@ -89,8 +131,8 @@ What other netCDF related Python libraries should I know about?
 `netCDF4-python`__ provides a lower level interface for working with
 netCDF and OpenDAP datasets in Python. We use netCDF4-python internally in
 xarray, and have contributed a number of improvements and fixes upstream. xarray
-does not yet support all of netCDF4-python's features, such as writing to
-netCDF groups or modifying files on-disk.
+does not yet support all of netCDF4-python's features, such as modifying files
+on-disk.
 
 __ https://github.com/Unidata/netcdf4-python
 
@@ -113,9 +155,15 @@ __ http://drclimate.wordpress.com/2014/01/02/a-beginners-guide-to-scripting-with
 
 We think the design decisions we have made for xarray (namely, basing it on
 pandas) make it a faster and more flexible data analysis tool. That said, Iris
-and CDAT have some great domain specific functionality, and we would love to
-have support for converting their native objects to and from xarray (see
-:issue:`37` and :issue:`133`)
+and CDAT have some great domain specific functionality, and xarray includes
+methods for converting back and forth between xarray and these libraries. See
+:py:meth:`~xarray.DataArray.to_iris` and :py:meth:`~xarray.DataArray.to_cdms2`
+for more details.
+
+What other projects leverage xarray?
+------------------------------------
+
+See section :ref:`related-projects`.
 
 How should I cite xarray?
 -------------------------
@@ -159,5 +207,5 @@ would certainly appreciate it. We recommend two citations.
                  month  = aug,
                  year   = 2016,
                  doi    = {10.5281/zenodo.59499},
-                 url    = {http://dx.doi.org/10.5281/zenodo.59499}
+                 url    = {https://doi.org/10.5281/zenodo.59499}
                 }

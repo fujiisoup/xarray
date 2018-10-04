@@ -1,20 +1,22 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
+from __future__ import absolute_import, division, print_function
+
+import pytest
 
 import xarray as xr
 
 from . import TestCase, raises_regex
+
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 
 
 @xr.register_dataset_accessor('example_accessor')
 @xr.register_dataarray_accessor('example_accessor')
 class ExampleAccessor(object):
     """For the pickling tests below."""
+
     def __init__(self, xarray_obj):
         self.obj = xarray_obj
 
@@ -26,6 +28,7 @@ class TestAccessor(TestCase):
         @xr.register_dataarray_accessor('demo')
         class DemoAccessor(object):
             """Demo accessor."""
+
             def __init__(self, xarray_obj):
                 self._obj = xarray_obj
 
@@ -52,7 +55,7 @@ class TestAccessor(TestCase):
         del xr.Dataset.demo
         assert not hasattr(xr.Dataset, 'demo')
 
-        with self.assertWarns('overriding a preexisting attribute'):
+        with pytest.warns(Warning, match='overriding a preexisting attribute'):
             @xr.register_dataarray_accessor('demo')
             class Foo(object):
                 pass

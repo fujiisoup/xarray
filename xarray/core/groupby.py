@@ -1,21 +1,18 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+from __future__ import absolute_import, division, print_function
+
 import functools
+import warnings
+
 import numpy as np
 import pandas as pd
 
-from . import dtypes
-from . import duck_array_ops
-from . import nputils
-from . import ops
+from . import dtypes, duck_array_ops, nputils, ops, utils
+from .arithmetic import SupportsArithmetic
 from .combine import concat
-from .common import (
-    ImplementsArrayReduce, ImplementsDatasetReduce,
-)
-from .pycompat import range, zip, integer_types
-from .utils import hashable, peek_at, maybe_wrap_array, safe_cast_to_index
-from .variable import as_variable, Variable, IndexVariable
+from .common import ALL_DIMS, ImplementsArrayReduce, ImplementsDatasetReduce
+from .pycompat import integer_types, range, zip
+from .utils import hashable, maybe_wrap_array, peek_at, safe_cast_to_index
+from .variable import IndexVariable, Variable, as_variable
 
 
 def unique_value_groups(ar, sort=True):
@@ -80,9 +77,9 @@ def _consolidate_slices(slices):
     for slice_ in slices:
         if not isinstance(slice_, slice):
             raise ValueError('list element is not a slice: %r' % slice_)
-        if (result and last_slice.stop == slice_.start
-                and _is_one_or_none(last_slice.step)
-                and _is_one_or_none(slice_.step)):
+        if (result and last_slice.stop == slice_.start and
+                _is_one_or_none(last_slice.step) and
+                _is_one_or_none(slice_.step)):
             last_slice = slice(last_slice.start, slice_.stop, slice_.step)
             result[-1] = last_slice
         else:
@@ -156,7 +153,7 @@ def _unique_and_monotonic(group):
         return index.is_unique and index.is_monotonic
 
 
-class GroupBy(object):
+class GroupBy(SupportsArithmetic):
     """A object that implements the split-apply-combine pattern.
 
     Modeled after `pandas.GroupBy`. The `GroupBy` object can be iterated over
@@ -172,6 +169,7 @@ class GroupBy(object):
     Dataset.groupby
     DataArray.groupby
     """
+
     def __init__(self, obj, group, squeeze=False, grouper=None, bins=None,
                  cut_kwargs={}):
         """Create a GroupBy object
@@ -441,6 +439,7 @@ def _maybe_reorder(xarray_obj, dim, positions):
 class DataArrayGroupBy(GroupBy, ImplementsArrayReduce):
     """GroupBy object specialized to grouping DataArray objects
     """
+
     def _iter_grouped_shortcut(self):
         """Fast version of `_iter_grouped` that yields Variables without
         metadata
@@ -548,8 +547,8 @@ class DataArrayGroupBy(GroupBy, ImplementsArrayReduce):
         ----------
         func : function
             Function which can be called in the form
-            `func(x, axis=axis, **kwargs)` to return the result of collapsing an
-            np.ndarray over an integer valued axis.
+            `func(x, axis=axis, **kwargs)` to return the result of collapsing
+            an np.ndarray over an integer valued axis.
         dim : str or sequence of str, optional
             Dimension(s) over which to apply `func`.
         axis : int or sequence of int, optional
@@ -569,9 +568,39 @@ class DataArrayGroupBy(GroupBy, ImplementsArrayReduce):
             Array with summarized data and the indicated dimension(s)
             removed.
         """
+        if dim == DEFAULT_DIMS:
+            dim = ALL_DIMS
+            # TODO change this to dim = self._group_dim after
+            # the deprecation process
+            if self._obj.ndim > 1:
+                warnings.warn(
+                    "Default reduction dimension will be changed to the "
+                    "grouped dimension after xarray 0.12. To silence this "
+                    "warning, pass dim=xarray.ALL_DIMS explicitly.",
+                    FutureWarning, stacklevel=2)
+
         def reduce_array(ar):
             return ar.reduce(func, dim, axis, keep_attrs=keep_attrs, **kwargs)
         return self.apply(reduce_array, shortcut=shortcut)
+
+    # TODO remove the following class method and DEFAULT_DIMS after the
+    # deprecation cycle
+    @classmethod
+    def _reduce_method(cls, func, include_skipna, numeric_only):
+        if include_skipna:
+            def wrapped_func(self, dim=DEFAULT_DIMS, axis=None, skipna=None,
+                             keep_attrs=False, **kwargs):
+                return self.reduce(func, dim, axis, keep_attrs=keep_attrs,
+                                   skipna=skipna, allow_lazy=True, **kwargs)
+        else:
+            def wrapped_func(self, dim=DEFAULT_DIMS, axis=None,
+                             keep_attrs=False, **kwargs):
+                return self.reduce(func, dim, axis, keep_attrs=keep_attrs,
+                                   allow_lazy=True, **kwargs)
+        return wrapped_func
+
+
+DEFAULT_DIMS = utils.ReprObject('<default-dims>')
 
 ops.inject_reduce_methods(DataArrayGroupBy)
 ops.inject_binary_ops(DataArrayGroupBy)
@@ -629,8 +658,8 @@ class DatasetGroupBy(GroupBy, ImplementsDatasetReduce):
         ----------
         func : function
             Function which can be called in the form
-            `func(x, axis=axis, **kwargs)` to return the result of collapsing an
-            np.ndarray over an integer valued axis.
+            `func(x, axis=axis, **kwargs)` to return the result of collapsing
+            an np.ndarray over an integer valued axis.
         dim : str or sequence of str, optional
             Dimension(s) over which to apply `func`.
         axis : int or sequence of int, optional
@@ -650,9 +679,39 @@ class DatasetGroupBy(GroupBy, ImplementsDatasetReduce):
             Array with summarized data and the indicated dimension(s)
             removed.
         """
+        if dim == DEFAULT_DIMS:
+            dim = ALL_DIMS
+            # TODO change this to dim = self._group_dim after
+            # the deprecation process. Do not forget to remove _reduce_method
+            warnings.warn(
+                "Default reduction dimension will be changed to the "
+                "grouped dimension after xarray 0.12. To silence this "
+                "warning, pass dim=xarray.ALL_DIMS explicitly.",
+                FutureWarning, stacklevel=2)
+        elif dim is None:
+            dim = self._group_dim
+
         def reduce_dataset(ds):
             return ds.reduce(func, dim, keep_attrs, **kwargs)
         return self.apply(reduce_dataset)
+
+    # TODO remove the following class method and DEFAULT_DIMS after the
+    # deprecation cycle
+    @classmethod
+    def _reduce_method(cls, func, include_skipna, numeric_only):
+        if include_skipna:
+            def wrapped_func(self, dim=DEFAULT_DIMS, keep_attrs=False,
+                             skipna=None, **kwargs):
+                return self.reduce(func, dim, keep_attrs, skipna=skipna,
+                                   numeric_only=numeric_only, allow_lazy=True,
+                                   **kwargs)
+        else:
+            def wrapped_func(self, dim=DEFAULT_DIMS, keep_attrs=False,
+                             **kwargs):
+                return self.reduce(func, dim, keep_attrs,
+                                   numeric_only=numeric_only, allow_lazy=True,
+                                   **kwargs)
+        return wrapped_func
 
     def assign(self, **kwargs):
         """Assign data variables by group.
@@ -662,6 +721,7 @@ class DatasetGroupBy(GroupBy, ImplementsDatasetReduce):
         Dataset.assign
         """
         return self.apply(lambda ds: ds.assign(**kwargs))
+
 
 ops.inject_reduce_methods(DatasetGroupBy)
 ops.inject_binary_ops(DatasetGroupBy)

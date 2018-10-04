@@ -1,6 +1,7 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+# flake8: noqa
+
+from __future__ import absolute_import, division, print_function
+
 import sys
 
 import numpy as np
@@ -12,7 +13,7 @@ if PY3:  # pragma: no cover
     basestring = str
     unicode_type = str
     bytes_type = bytes
-    integer_types = (int, np.integer)
+    native_int_types = (int,)
 
     def iteritems(d):
         return iter(d.items())
@@ -22,6 +23,7 @@ if PY3:  # pragma: no cover
 
     range = range
     zip = zip
+    from itertools import zip_longest
     from functools import reduce
     import builtins
     from urllib.request import urlretrieve
@@ -31,7 +33,7 @@ else:  # pragma: no cover
     basestring = basestring  # noqa
     unicode_type = unicode  # noqa
     bytes_type = str
-    integer_types = (int, long, np.integer)  # noqa
+    native_int_types = (int, long)  # noqa
 
     def iteritems(d):
         return d.iteritems()
@@ -40,11 +42,16 @@ else:  # pragma: no cover
         return d.itervalues()
 
     range = xrange
-    from itertools import izip as zip, imap as map
+    from itertools import (
+        izip as zip, imap as map, izip_longest as zip_longest,
+    )
     reduce = reduce
     import __builtin__ as builtins
     from urllib import urlretrieve
     from inspect import getargspec
+
+integer_types = native_int_types + (np.integer,)
+
 try:
     from cyordereddict import OrderedDict
 except ImportError:  # pragma: no cover
@@ -103,7 +110,8 @@ except ImportError:
             # exactly reproduce the limitations of the CPython interpreter.
             #
             # See http://bugs.python.org/issue12029 for more details
-            return exctype is not None and issubclass(exctype, self._exceptions)
+            return exctype is not None and issubclass(
+                exctype, self._exceptions)
 try:
     from contextlib import ExitStack
 except ImportError:
@@ -123,6 +131,7 @@ except ImportError:
                 # in the list raise an exception
 
         """
+
         def __init__(self):
             self._exit_callbacks = deque()
 
@@ -158,7 +167,7 @@ except ImportError:
                 self._exit_callbacks.append(exit)
             else:
                 self._push_cm_exit(exit, exit_method)
-            return exit # Allow use as a decorator
+            return exit  # Allow use as a decorator
 
         def callback(self, callback, *args, **kwds):
             """Registers an arbitrary callback and arguments.
@@ -171,7 +180,7 @@ except ImportError:
             # setting __wrapped__ may still help with introspection
             _exit_wrapper.__wrapped__ = callback
             self.push(_exit_wrapper)
-            return callback # Allow use as a decorator
+            return callback  # Allow use as a decorator
 
         def enter_context(self, cm):
             """Enters the supplied context manager
@@ -179,7 +188,8 @@ except ImportError:
             If successful, also pushes its __exit__ method as a callback and
             returns the result of the __enter__ method.
             """
-            # We look up the special methods on the type to match the with statement
+            # We look up the special methods on the type to match the with
+            # statement
             _cm_type = type(cm)
             _exit = _cm_type.__exit__
             result = _cm_type.__enter__(cm)
@@ -202,7 +212,7 @@ except ImportError:
 
             def _fix_exception_context(new_exc, old_exc):
                 # Context may not be correct, so find the end of the chain
-                while 1:
+                while True:
                     exc_context = new_exc.__context__
                     if exc_context is old_exc:
                         # Context is already set correctly (see issue 20317)
@@ -225,7 +235,7 @@ except ImportError:
                         suppressed_exc = True
                         pending_raise = False
                         exc_details = (None, None, None)
-                except:
+                except BaseException:
                     new_exc_details = sys.exc_info()
                     # simulate the stack of exceptions by setting the context
                     _fix_exception_context(new_exc_details[1], exc_details[1])

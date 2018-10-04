@@ -1,29 +1,23 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from datetime import timedelta
-from collections import defaultdict
+from __future__ import absolute_import, division, print_function
+
 import functools
 import itertools
-from distutils.version import LooseVersion
+from collections import defaultdict
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
 
-from . import common
-from . import duck_array_ops
-from . import dtypes
-from . import indexing
-from . import nputils
-from . import ops
-from . import utils
-from .pycompat import (basestring, OrderedDict, zip, integer_types,
-                       dask_array_type)
-from .indexing import (PandasIndexAdapter, xarray_indexable, BasicIndexer,
-                       OuterIndexer, VectorizedIndexer)
-from .utils import OrderedSet
-
 import xarray as xr  # only for Dataset and DataArray
+
+from . import (
+    arithmetic, common, dtypes, duck_array_ops, indexing, nputils, ops, utils)
+from .indexing import (
+    BasicIndexer, OuterIndexer, PandasIndexAdapter, VectorizedIndexer,
+    as_indexable)
+from .pycompat import (
+    OrderedDict, basestring, dask_array_type, integer_types, zip)
+from .utils import OrderedSet, either_dict_or_kwargs
 
 try:
     import dask.array as da
@@ -31,6 +25,8 @@ except ImportError:
     pass
 
 
+NON_NUMPY_SUPPORTED_ARRAY_TYPES = (
+    indexing.ExplicitlyIndexed, pd.Index) + dask_array_type
 BASIC_INDEXING_TYPES = integer_types + (slice,)
 
 
@@ -68,22 +64,15 @@ def as_variable(obj, name=None):
         The newly created variable.
 
     """
+    from .dataarray import DataArray
+
     # TODO: consider extending this method to automatically handle Iris and
-    # pandas objects.
-    if hasattr(obj, 'variable'):
+    if isinstance(obj, DataArray):
         # extract the primary Variable from DataArrays
         obj = obj.variable
 
     if isinstance(obj, Variable):
         obj = obj.copy(deep=False)
-    elif hasattr(obj, 'dims') and (hasattr(obj, 'data') or
-                                   hasattr(obj, 'values')):
-        obj_data = getattr(obj, 'data', None)
-        if obj_data is None:
-            obj_data = getattr(obj, 'values')
-        obj = Variable(obj.dims, obj_data,
-                       getattr(obj, 'attrs', None),
-                       getattr(obj, 'encoding', None))
     elif isinstance(obj, tuple):
         try:
             obj = Variable(*obj)
@@ -94,8 +83,11 @@ def as_variable(obj, name=None):
                             '{}'.format(obj))
     elif utils.is_scalar(obj):
         obj = Variable([], obj)
-    elif getattr(obj, 'name', None) is not None:
+    elif isinstance(obj, (pd.Index, IndexVariable)) and obj.name is not None:
         obj = Variable(obj.name, obj)
+    elif isinstance(obj, (set, dict)):
+        raise TypeError(
+            "variable %r has invalid type %r" % (name, type(obj)))
     elif name is not None:
         data = as_compatible_data(obj)
         if data.ndim != 1:
@@ -126,7 +118,7 @@ def _maybe_wrap_data(data):
     Put pandas.Index and numpy.ndarray arguments in adapter objects to ensure
     they can be indexed properly.
 
-    NumpyArrayAdapter, PandasIndexAdapter and LazilyIndexedArray should
+    NumpyArrayAdapter, PandasIndexAdapter and LazilyOuterIndexedArray should
     all pass through unmodified.
     """
     if isinstance(data, pd.Index):
@@ -159,12 +151,7 @@ def as_compatible_data(data, fastpath=False):
     if isinstance(data, Variable):
         return data.data
 
-    # add a custom fast-path for dask.array to avoid expensive checks for the
-    # dtype attribute
-    if isinstance(data, dask_array_type):
-        return data
-
-    if isinstance(data, pd.Index):
+    if isinstance(data, NON_NUMPY_SUPPORTED_ARRAY_TYPES):
         return _maybe_wrap_data(data)
 
     if isinstance(data, tuple):
@@ -177,14 +164,6 @@ def as_compatible_data(data, fastpath=False):
     if isinstance(data, timedelta):
         data = np.timedelta64(getattr(data, 'value', data), 'ns')
 
-    if (not hasattr(data, 'dtype') or not isinstance(data.dtype, np.dtype) or
-            not hasattr(data, 'shape') or
-            isinstance(data, (np.string_, np.unicode_,
-                              np.datetime64, np.timedelta64))):
-        # data must be ndarray-like
-        # don't allow non-numpy dtypes (e.g., categories)
-        data = np.asarray(data)
-
     # we don't want nested self-described arrays
     data = getattr(data, 'values', data)
 
@@ -196,6 +175,9 @@ def as_compatible_data(data, fastpath=False):
             data[mask] = fill_value
         else:
             data = np.asarray(data)
+
+    # validate whether the data is valid data types
+    data = np.asarray(data)
 
     if isinstance(data, np.ndarray):
         if data.dtype.kind == 'O':
@@ -231,8 +213,8 @@ def _as_array_or_item(data):
     return data
 
 
-class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
-
+class Variable(common.AbstractArray, arithmetic.SupportsArithmetic,
+               utils.NdimSizeLenMixin):
     """A netcdf-like variable consisting of dimensions, data and attributes
     which describe a single Array. A single Variable object is not fully
     described outside the context of its parent Dataset (if you want such a
@@ -296,9 +278,10 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
 
     @property
     def _in_memory(self):
-        return (isinstance(self._data, (np.ndarray, np.number, PandasIndexAdapter)) or
+        return (isinstance(self._data, (np.ndarray, np.number,
+                                        PandasIndexAdapter)) or
                 (isinstance(self._data, indexing.MemoryCachedArray) and
-                 isinstance(self._data.array, np.ndarray)))
+                 isinstance(self._data.array, indexing.NumpyIndexingAdapter)))
 
     @property
     def data(self):
@@ -314,10 +297,6 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
             raise ValueError(
                 "replacement data must match the Variable's shape")
         self._data = data
-
-    @property
-    def _indexable_data(self):
-        return xarray_indexable(self._data)
 
     def load(self, **kwargs):
         """Manually trigger loading of this variable's data from disk or a
@@ -362,6 +341,41 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         """
         new = self.copy(deep=False)
         return new.load(**kwargs)
+
+    def __dask_graph__(self):
+        if isinstance(self._data, dask_array_type):
+            return self._data.__dask_graph__()
+        else:
+            return None
+
+    def __dask_keys__(self):
+        return self._data.__dask_keys__()
+
+    @property
+    def __dask_optimize__(self):
+        return self._data.__dask_optimize__
+
+    @property
+    def __dask_scheduler__(self):
+        return self._data.__dask_scheduler__
+
+    def __dask_postcompute__(self):
+        array_func, array_args = self._data.__dask_postcompute__()
+        return self._dask_finalize, (array_func, array_args, self._dims,
+                                     self._attrs, self._encoding)
+
+    def __dask_postpersist__(self):
+        array_func, array_args = self._data.__dask_postpersist__()
+        return self._dask_finalize, (array_func, array_args, self._dims,
+                                     self._attrs, self._encoding)
+
+    @staticmethod
+    def _dask_finalize(results, array_func, array_args, dims, attrs, encoding):
+        if isinstance(results, dict):  # persist case
+            name = array_args[0]
+            results = {k: v for k, v in results.items() if k[0] == name}
+        data = array_func(results, *array_args)
+        return Variable(dims, data, attrs=attrs, encoding=encoding)
 
     @property
     def values(self):
@@ -440,9 +454,15 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         key = self._item_key_to_tuple(key)  # key is a tuple
         # key is a tuple of full size
         key = indexing.expanded_indexer(key, self.ndim)
-        # Convert a scalar Variable as an integer
-        key = tuple([(k.data.item() if isinstance(k, Variable) and k.ndim == 0
-                      else k) for k in key])
+        # Convert a scalar Variable to an integer
+        key = tuple(
+            k.data.item() if isinstance(k, Variable) and k.ndim == 0 else k
+            for k in key)
+        # Convert a 0d-array to an integer
+        key = tuple(
+            k.item() if isinstance(k, np.ndarray) and k.ndim == 0 else k
+            for k in key)
+
         if all(isinstance(k, BASIC_INDEXING_TYPES) for k in key):
             return self._broadcast_indexes_basic(key)
 
@@ -461,9 +481,8 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
                 if len(k.dims) > 1:
                     return self._broadcast_indexes_vectorized(key)
                 dims.append(k.dims[0])
-            if not isinstance(k, integer_types):
+            elif not isinstance(k, integer_types):
                 dims.append(d)
-
         if len(set(dims)) == len(dims):
             return self._broadcast_indexes_outer(key)
 
@@ -506,17 +525,18 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         dims = tuple(k.dims[0] if isinstance(k, Variable) else dim
                      for k, dim in zip(key, self.dims)
                      if not isinstance(k, integer_types))
-        indexer = []
+
+        new_key = []
         for k in key:
             if isinstance(k, Variable):
                 k = k.data
-
-            if isinstance(k, BASIC_INDEXING_TYPES):
-                indexer.append(k)
-            else:
+            if not isinstance(k, BASIC_INDEXING_TYPES):
                 k = np.asarray(k)
-                indexer.append(k if k.dtype.kind != 'b' else np.flatnonzero(k))
-        return dims, OuterIndexer(indexer), None
+                if k.dtype.kind == 'b':
+                    (k,) = np.nonzero(k)
+            new_key.append(k)
+
+        return dims, OuterIndexer(tuple(new_key)), None
 
     def _nonzero(self):
         """ Equivalent numpy's nonzero but returns a tuple of Varibles. """
@@ -578,7 +598,7 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         else:
             new_order = None
 
-        return out_dims, VectorizedIndexer(out_key), new_order
+        return out_dims, VectorizedIndexer(tuple(out_key)), new_order
 
     def __getitem__(self, key):
         """Return a new Array object whose contents are consistent with
@@ -593,12 +613,55 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         If you really want to do indexing like `x[x > 0]`, manipulate the numpy
         array `x.values` directly.
         """
-        dims, index_tuple, new_order = self._broadcast_indexes(key)
-        data = self._indexable_data[index_tuple]
+        dims, indexer, new_order = self._broadcast_indexes(key)
+        data = as_indexable(self._data)[indexer]
         if new_order:
             data = np.moveaxis(data, range(len(new_order)), new_order)
+        return self._finalize_indexing_result(dims, data)
+
+    def _finalize_indexing_result(self, dims, data):
+        """Used by IndexVariable to return IndexVariable objects when possible.
+        """
         return type(self)(dims, data, self._attrs, self._encoding,
                           fastpath=True)
+
+    def _getitem_with_mask(self, key, fill_value=dtypes.NA):
+        """Index this Variable with -1 remapped to fill_value."""
+        # TODO(shoyer): expose this method in public API somewhere (isel?) and
+        # use it for reindex.
+        # TODO(shoyer): add a sanity check that all other integers are
+        # non-negative
+        # TODO(shoyer): add an optimization, remapping -1 to an adjacent value
+        # that is actually indexed rather than mapping it to the last value
+        # along each axis.
+
+        if fill_value is dtypes.NA:
+            fill_value = dtypes.get_fill_value(self.dtype)
+
+        dims, indexer, new_order = self._broadcast_indexes(key)
+
+        if self.size:
+            if isinstance(self._data, dask_array_type):
+                # dask's indexing is faster this way; also vindex does not
+                # support negative indices yet:
+                # https://github.com/dask/dask/pull/2967
+                actual_indexer = indexing.posify_mask_indexer(indexer)
+            else:
+                actual_indexer = indexer
+
+            data = as_indexable(self._data)[actual_indexer]
+            chunks_hint = getattr(data, 'chunks', None)
+            mask = indexing.create_mask(indexer, self.shape, chunks_hint)
+            data = duck_array_ops.where(mask, fill_value, data)
+        else:
+            # array cannot be indexed along dimensions of size 0, so just
+            # build the mask directly instead.
+            mask = indexing.create_mask(indexer, self.shape)
+            data = np.broadcast_to(fill_value, getattr(mask, 'shape', ()))
+
+        if new_order:
+            data = np.moveaxis(data, range(len(new_order)), new_order)
+        return self._finalize_indexing_result(dims, data)
 
     def __setitem__(self, key, value):
         """__setitem__ is overloaded to access the underlying numpy values with
@@ -608,22 +671,28 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         """
         dims, index_tuple, new_order = self._broadcast_indexes(key)
 
-        if isinstance(value, Variable):
-            value = value.set_dims(dims).data
+        if not isinstance(value, Variable):
+            value = as_compatible_data(value)
+            if value.ndim > len(dims):
+                raise ValueError(
+                    'shape mismatch: value array of shape %s could not be '
+                    'broadcast to indexing result with %s dimensions'
+                    % (value.shape, len(dims)))
+            if value.ndim == 0:
+                value = Variable((), value)
+            else:
+                value = Variable(dims[-value.ndim:], value)
+        # broadcast to become assignable
+        value = value.set_dims(dims).data
 
         if new_order:
             value = duck_array_ops.asarray(value)
-            if value.ndim > len(dims):
-                raise ValueError(
-                    'shape mismatch: value array of shape %s could not be'
-                    'broadcast to indexing result with %s dimensions'
-                    % (value.shape, len(dims)))
-
             value = value[(len(dims) - value.ndim) * (np.newaxis,) +
                           (Ellipsis,)]
             value = np.moveaxis(value, new_order, range(len(new_order)))
 
-        self._indexable_data[index_tuple] = value
+        indexable = as_indexable(self._data)
+        indexable[index_tuple] = value
 
     @property
     def attrs(self):
@@ -652,24 +721,81 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         except ValueError:
             raise ValueError('encoding must be castable to a dictionary')
 
-    def copy(self, deep=True):
+    def copy(self, deep=True, data=None):
         """Returns a copy of this object.
 
         If `deep=True`, the data array is loaded into memory and copied onto
         the new object. Dimensions, attributes and encodings are always copied.
+
+        Use `data` to create a new object with the same structure as
+        original but entirely new data.
+
+        Parameters
+        ----------
+        deep : bool, optional
+            Whether the data array is loaded into memory and copied onto
+            the new object. Default is True.
+        data : array_like, optional
+            Data to use in the new object. Must have same shape as original.
+            When `data` is used, `deep` is ignored.
+
+        Returns
+        -------
+        object : Variable
+            New object with dimensions, attributes, encodings, and optionally
+            data copied from original.
+
+        Examples
+        --------
+
+        Shallow copy versus deep copy
+
+        >>> var = xr.Variable(data=[1, 2, 3], dims='x')
+        >>> var.copy()
+        <xarray.Variable (x: 3)>
+        array([1, 2, 3])
+        >>> var_0 = var.copy(deep=False)
+        >>> var_0[0] = 7
+        >>> var_0
+        <xarray.Variable (x: 3)>
+        array([7, 2, 3])
+        >>> var
+        <xarray.Variable (x: 3)>
+        array([7, 2, 3])
+
+        Changing the data using the ``data`` argument maintains the
+        structure of the original object, but with the new data. Original
+        object is unaffected.
+
+        >>> var.copy(data=[0.1, 0.2, 0.3])
+        <xarray.Variable (x: 3)>
+        array([ 0.1,  0.2,  0.3])
+        >>> var
+        <xarray.Variable (x: 3)>
+        array([7, 2, 3])
+
+        See Also
+        --------
+        pandas.DataFrame.copy
         """
-        data = self._data
+        if data is None:
+            data = self._data
 
-        if isinstance(data, indexing.MemoryCachedArray):
-            # don't share caching between copies
-            data = indexing.MemoryCachedArray(data.array)
+            if isinstance(data, indexing.MemoryCachedArray):
+                # don't share caching between copies
+                data = indexing.MemoryCachedArray(data.array)
 
-        if deep:
-            if isinstance(data, dask_array_type):
-                data = data.copy()
-            elif not isinstance(data, PandasIndexAdapter):
-                # pandas.Index is immutable
-                data = np.array(data)
+            if deep:
+                if isinstance(data, dask_array_type):
+                    data = data.copy()
+                elif not isinstance(data, PandasIndexAdapter):
+                    # pandas.Index is immutable
+                    data = np.array(data)
+        else:
+            data = as_compatible_data(data)
+            if self.shape != data.shape:
+                raise ValueError("Data shape {} must match shape of object {}"
+                                 .format(data.shape, self.shape))
 
         # note:
         # dims is already an immutable tuple
@@ -740,12 +866,18 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
             if utils.is_dict_like(chunks):
                 chunks = tuple(chunks.get(n, s)
                                for n, s in enumerate(self.shape))
+            # da.from_array works by using lazily indexing with a tuple of
+            # slices. Using OuterIndexer is a pragmatic choice: dask does not
+            # yet handle different indexing types in an explicit way:
+            # https://github.com/dask/dask/issues/2883
+            data = indexing.ImplicitToExplicitIndexingAdapter(
+                data, indexing.OuterIndexer)
             data = da.from_array(data, chunks, name=name, lock=lock)
 
         return type(self)(self.dims, data, self._attrs, self._encoding,
                           fastpath=True)
 
-    def isel(self, **indexers):
+    def isel(self, indexers=None, drop=False, **indexers_kwargs):
         """Return a new array indexed along the specified dimension(s).
 
         Parameters
@@ -762,6 +894,8 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
             unless numpy fancy indexing was triggered by using an array
             indexer, in which case the data will be a copy.
         """
+        indexers = either_dict_or_kwargs(indexers, indexers_kwargs, 'isel')
+
         invalid = [k for k in indexers if k not in self.dims]
         if invalid:
             raise ValueError("dimensions %r do not exist" % invalid)
@@ -793,7 +927,7 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         numpy.squeeze
         """
         dims = common.get_squeeze_dims(self, dim)
-        return self.isel(**{d: 0 for d in dims})
+        return self.isel({d: 0 for d in dims})
 
     def _shift_one_dim(self, dim, count):
         axis = self.get_axis_num(dim)
@@ -835,26 +969,83 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
 
         return type(self)(self.dims, data, self._attrs, fastpath=True)
 
-    def shift(self, **shifts):
+    def shift(self, shifts=None, **shifts_kwargs):
         """
         Return a new Variable with shifted data.
 
         Parameters
         ----------
-        **shifts : keyword arguments of the form {dim: offset}
+        shifts : mapping of the form {dim: offset}
             Integer offset to shift along each of the given dimensions.
             Positive offsets shift to the right; negative offsets shift to the
             left.
+        **shifts_kwargs:
+            The keyword arguments form of ``shifts``.
+            One of shifts or shifts_kwarg must be provided.
 
         Returns
         -------
         shifted : Variable
             Variable with the same dimensions and attributes but shifted data.
         """
+        shifts = either_dict_or_kwargs(shifts, shifts_kwargs, 'shift')
         result = self
         for dim, count in shifts.items():
             result = result._shift_one_dim(dim, count)
         return result
+
+    def pad_with_fill_value(self, pad_widths=None, fill_value=dtypes.NA,
+                            **pad_widths_kwargs):
+        """
+        Return a new Variable with paddings.
+
+        Parameters
+        ----------
+        pad_width: Mapping of the form {dim: (before, after)}
+            Number of values padded to the edges of each dimension.
+        **pad_widths_kwargs:
+            Keyword argument for pad_widths
+        """
+        pad_widths = either_dict_or_kwargs(pad_widths, pad_widths_kwargs,
+                                           'pad')
+
+        if fill_value is dtypes.NA:  # np.nan is passed
+            dtype, fill_value = dtypes.maybe_promote(self.dtype)
+        else:
+            dtype = self.dtype
+
+        if isinstance(self.data, dask_array_type):
+            array = self.data
+
+            # Dask does not yet support pad. We manually implement it.
+            # https://github.com/dask/dask/issues/1926
+            for d, pad in pad_widths.items():
+                axis = self.get_axis_num(d)
+                before_shape = list(array.shape)
+                before_shape[axis] = pad[0]
+                before_chunks = list(array.chunks)
+                before_chunks[axis] = (pad[0], )
+                after_shape = list(array.shape)
+                after_shape[axis] = pad[1]
+                after_chunks = list(array.chunks)
+                after_chunks[axis] = (pad[1], )
+
+                arrays = []
+                if pad[0] > 0:
+                    arrays.append(da.full(before_shape, fill_value,
+                                          dtype=dtype, chunks=before_chunks))
+                arrays.append(array)
+                if pad[1] > 0:
+                    arrays.append(da.full(after_shape, fill_value,
+                                          dtype=dtype, chunks=after_chunks))
+                if len(arrays) > 1:
+                    array = da.concatenate(arrays, axis=axis)
+        else:
+            pads = [(0, 0) if d not in pad_widths else pad_widths[d]
+                    for d in self.dims]
+            array = np.pad(self.data.astype(dtype, copy=False), pads,
+                           mode='constant', constant_values=fill_value)
+        return type(self)(self.dims, array)
 
     def _roll_one_dim(self, dim, count):
         axis = self.get_axis_num(dim)
@@ -878,22 +1069,27 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
 
         return type(self)(self.dims, data, self._attrs, fastpath=True)
 
-    def roll(self, **shifts):
+    def roll(self, shifts=None, **shifts_kwargs):
         """
         Return a new Variable with rolld data.
 
         Parameters
         ----------
-        **shifts : keyword arguments of the form {dim: offset}
+        shifts : mapping of the form {dim: offset}
             Integer offset to roll along each of the given dimensions.
             Positive offsets roll to the right; negative offsets roll to the
             left.
+        **shifts_kwargs:
+            The keyword arguments form of ``shifts``.
+            One of shifts or shifts_kwarg must be provided.
 
         Returns
         -------
         shifted : Variable
             Variable with the same dimensions and attributes but rolled data.
         """
+        shifts = either_dict_or_kwargs(shifts, shifts_kwargs, 'roll')
+
         result = self
         for dim, count in shifts.items():
             result = result._roll_one_dim(dim, count)
@@ -928,7 +1124,8 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         axes = self.get_axis_num(dims)
         if len(dims) < 2:  # no need to transpose if only one dimension
             return self.copy(deep=False)
-        data = duck_array_ops.transpose(self.data, axes)
+
+        data = as_indexable(self._data).transpose(axes)
         return type(self)(dims, data, self._attrs, self._encoding,
                           fastpath=True)
 
@@ -1010,7 +1207,7 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         return Variable(new_dims, new_data, self._attrs, self._encoding,
                         fastpath=True)
 
-    def stack(self, **dimensions):
+    def stack(self, dimensions=None, **dimensions_kwargs):
         """
         Stack any number of existing dimensions into a single new dimension.
 
@@ -1019,9 +1216,12 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
 
         Parameters
         ----------
-        **dimensions : keyword arguments of the form new_name=(dim1, dim2, ...)
+        dimensions : Mapping of form new_name=(dim1, dim2, ...)
             Names of new dimensions, and the existing dimensions that they
             replace.
+        **dimensions_kwargs:
+            The keyword arguments form of ``dimensions``.
+            One of dimensions or dimensions_kwargs must be provided.
 
         Returns
         -------
@@ -1032,6 +1232,8 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         --------
         Variable.unstack
         """
+        dimensions = either_dict_or_kwargs(dimensions, dimensions_kwargs,
+                                           'stack')
         result = self
         for new_dim, dims in dimensions.items():
             result = result._stack_once(dims, new_dim)
@@ -1063,7 +1265,7 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         return Variable(new_dims, new_data, self._attrs, self._encoding,
                         fastpath=True)
 
-    def unstack(self, **dimensions):
+    def unstack(self, dimensions=None, **dimensions_kwargs):
         """
         Unstack an existing dimension into multiple new dimensions.
 
@@ -1072,9 +1274,12 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
 
         Parameters
         ----------
-        **dimensions : keyword arguments of the form old_dim={dim1: size1, ...}
-            Names of existing dimensions, and the new dimensions and sizes that they
-            map to.
+        dimensions : mapping of the form old_dim={dim1: size1, ...}
+            Names of existing dimensions, and the new dimensions and sizes
+            that they map to.
+        **dimensions_kwargs:
+            The keyword arguments form of ``dimensions``.
+            One of dimensions or dimensions_kwargs must be provided.
 
         Returns
         -------
@@ -1085,6 +1290,8 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         --------
         Variable.stack
         """
+        dimensions = either_dict_or_kwargs(dimensions, dimensions_kwargs,
+                                           'unstack')
         result = self
         for old_dim, dims in dimensions.items():
             result = result._unstack_once(dims, old_dim)
@@ -1126,13 +1333,10 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
             Array with summarized data and the indicated dimension(s)
             removed.
         """
+        if dim is common.ALL_DIMS:
+            dim = None
         if dim is not None and axis is not None:
             raise ValueError("cannot supply both 'axis' and 'dim' arguments")
-
-        if getattr(func, 'keep_dims', False):
-            if dim is None and axis is None:
-                raise ValueError("must supply either single 'dim' or 'axis' "
-                                 "argument to %s" % (func.__name__))
 
         if dim is not None:
             axis = self.get_axis_num(dim)
@@ -1169,9 +1373,9 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
             dimension is unchanged. Where to insert the new dimension is
             determined by the first variable.
         positions : None or list of integer arrays, optional
-            List of integer arrays which specifies the integer positions to which
-            to assign each dataset along the concatenated dimension. If not
-            supplied, objects are concatenated in the provided order.
+            List of integer arrays which specifies the integer positions to
+            which to assign each dataset along the concatenated dimension.
+            If not supplied, objects are concatenated in the provided order.
         shortcut : bool, optional
             This option is used internally to speed-up groupby operations.
             If `shortcut` is True, some checks of internal consistency between
@@ -1193,8 +1397,6 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
 
         arrays = [v.data for v in variables]
 
-        # TODO: use our own type promotion rules to ensure that
-        # [str, float] -> object, not str like numpy
         if dim in first_var.dims:
             axis = first_var.get_axis_num(dim)
             dims = first_var.dims
@@ -1308,14 +1510,10 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         numpy.nanpercentile, pandas.Series.quantile, Dataset.quantile,
         DataArray.quantile
         """
-
         if isinstance(self.data, dask_array_type):
             raise TypeError("quantile does not work for arrays stored as dask "
                             "arrays. Load the data via .compute() or .load() "
                             "prior to calling this method.")
-        if LooseVersion(np.__version__) < LooseVersion('1.10.0'):
-            raise NotImplementedError(
-                'quantile requres numpy version 1.10.0 or later')
 
         q = np.asarray(q, dtype=np.float64)
 
@@ -1338,6 +1536,98 @@ class Variable(common.AbstractArray, utils.NdimSizeLenMixin):
         qs = np.nanpercentile(self.data, q * 100., axis=axis,
                               interpolation=interpolation)
         return Variable(new_dims, qs)
+
+    def rank(self, dim, pct=False):
+        """Ranks the data.
+
+        Equal values are assigned a rank that is the average of the ranks that
+        would have been otherwise assigned to all of the values within that
+        set.  Ranks begin at 1, not 0. If `pct`, computes percentage ranks.
+
+        NaNs in the input array are returned as NaNs.
+
+        The `bottleneck` library is required.
+
+        Parameters
+        ----------
+        dim : str
+            Dimension over which to compute rank.
+        pct : bool, optional
+            If True, compute percentage ranks, otherwise compute integer ranks.
+
+        Returns
+        -------
+        ranked : Variable
+
+        See Also
+        --------
+        Dataset.rank, DataArray.rank
+        """
+        import bottleneck as bn
+
+        if isinstance(self.data, dask_array_type):
+            raise TypeError("rank does not work for arrays stored as dask "
+                            "arrays. Load the data via .compute() or .load() "
+                            "prior to calling this method.")
+
+        axis = self.get_axis_num(dim)
+        func = bn.nanrankdata if self.dtype.kind is 'f' else bn.rankdata
+        ranked = func(self.data, axis=axis)
+        if pct:
+            count = np.sum(~np.isnan(self.data), axis=axis, keepdims=True)
+            ranked /= count
+        return Variable(self.dims, ranked)
+
+    def rolling_window(self, dim, window, window_dim, center=False,
+                       fill_value=dtypes.NA):
+        """
+        Make a rolling_window along dim and add a new_dim to the last place.
+
+        Parameters
+        ----------
+        dim: str
+            Dimension over which to compute rolling_window
+        window: int
+            Window size of the rolling
+        window_dim: str
+            New name of the window dimension.
+        center: boolean. default False.
+            If True, pad fill_value for both ends. Otherwise, pad in the head
+            of the axis.
+        fill_value:
+            value to be filled.
+
+        Returns
+        -------
+        Variable that is a view of the original array with a added dimension of
+        size w.
+        The return dim: self.dims + (window_dim, )
+        The return shape: self.shape + (window, )
+
+        Examples
+        --------
+        >>> v=Variable(('a', 'b'), np.arange(8).reshape((2,4)))
+        >>> v.rolling_window(x, 'b', 3, 'window_dim')
+        <xarray.Variable (a: 2, b: 4, window_dim: 3)>
+        array([[[nan, nan, 0], [nan, 0, 1], [0, 1, 2], [1, 2, 3]],
+               [[nan, nan, 4], [nan, 4, 5], [4, 5, 6], [5, 6, 7]]])
+
+        >>> v.rolling_window(x, 'b', 3, 'window_dim', center=True)
+        <xarray.Variable (a: 2, b: 4, window_dim: 3)>
+        array([[[nan, 0, 1], [0, 1, 2], [1, 2, 3], [2, 3, nan]],
+               [[nan, 4, 5], [4, 5, 6], [5, 6, 7], [6, 7, nan]]])
+        """
+        if fill_value is dtypes.NA:  # np.nan is passed
+            dtype, fill_value = dtypes.maybe_promote(self.dtype)
+            array = self.astype(dtype, copy=False).data
+        else:
+            dtype = self.dtype
+            array = self.data
+
+        new_dims = self.dims + (window_dim, )
+        return Variable(new_dims, duck_array_ops.rolling_window(
+            array, axis=self.get_axis_num(dim), window=window,
+            center=center, fill_value=fill_value))
 
     @property
     def real(self):
@@ -1428,14 +1718,12 @@ class IndexVariable(Variable):
         # Dummy - do not chunk. This method is invoked e.g. by Dataset.chunk()
         return self.copy(deep=False)
 
-    def __getitem__(self, key):
-        dims, index_tuple, new_order = self._broadcast_indexes(key)
-        values = self._indexable_data[index_tuple]
-        if getattr(values, 'ndim', 0) != 1:
+    def _finalize_indexing_result(self, dims, data):
+        if getattr(data, 'ndim', 0) != 1:
             # returns Variable rather than IndexVariable if multi-dimensional
-            return Variable(dims, values, self._attrs, self._encoding)
+            return Variable(dims, data, self._attrs, self._encoding)
         else:
-            return type(self)(dims, values, self._attrs,
+            return type(self)(dims, data, self._attrs,
                               self._encoding, fastpath=True)
 
     def __setitem__(self, key, value):
@@ -1480,14 +1768,37 @@ class IndexVariable(Variable):
 
         return cls(first_var.dims, data, attrs)
 
-    def copy(self, deep=True):
+    def copy(self, deep=True, data=None):
         """Returns a copy of this object.
 
-        `deep` is ignored since data is stored in the form of pandas.Index,
-        which is already immutable. Dimensions, attributes and encodings are
-        always copied.
+        `deep` is ignored since data is stored in the form of
+        pandas.Index, which is already immutable. Dimensions, attributes
+        and encodings are always copied.
+
+        Use `data` to create a new object with the same structure as
+        original but entirely new data.
+
+        Parameters
+        ----------
+        deep : bool, optional
+            Deep is always ignored.
+        data : array_like, optional
+            Data to use in the new object. Must have same shape as original.
+
+        Returns
+        -------
+        object : Variable
+            New object with dimensions, attributes, encodings, and optionally
+            data copied from original.
         """
-        return type(self)(self.dims, self._data, self._attrs,
+        if data is None:
+            data = self._data
+        else:
+            data = as_compatible_data(data)
+            if self.shape != data.shape:
+                raise ValueError("Data shape {} must match shape of object {}"
+                                 .format(data.shape, self.shape))
+        return type(self)(self.dims, data, self._attrs,
                           self._encoding, fastpath=True)
 
     def equals(self, other, equiv=None):
@@ -1578,6 +1889,11 @@ def _unified_dims(variables):
 
 
 def _broadcast_compat_variables(*variables):
+    """Create broadcast compatible variables, with the same dimensions.
+
+    Unlike the result of broadcast_variables(), some variables may have
+    dimensions of size 1 instead of the the size of the broadcast dimension.
+    """
     dims = tuple(_unified_dims(variables))
     return tuple(var.set_dims(dims) if var.dims != dims else var
                  for var in variables)
@@ -1660,12 +1976,15 @@ def assert_unique_multiindex_level_names(variables):
     objects.
     """
     level_names = defaultdict(list)
+    all_level_names = set()
     for var_name, var in variables.items():
         if isinstance(var._data, PandasIndexAdapter):
             idx_level_names = var.to_index_variable().level_names
             if idx_level_names is not None:
                 for n in idx_level_names:
                     level_names[n].append('%r (%s)' % (n, var_name))
+            if idx_level_names:
+                all_level_names.update(idx_level_names)
 
     for k, v in level_names.items():
         if k in variables:
@@ -1676,3 +1995,9 @@ def assert_unique_multiindex_level_names(variables):
         conflict_str = '\n'.join([', '.join(v) for v in duplicate_names])
         raise ValueError('conflicting MultiIndex level name(s):\n%s'
                          % conflict_str)
+    # Check confliction between level names and dimensions GH:2299
+    for k, v in variables.items():
+        for d in v.dims:
+            if d in all_level_names:
+                raise ValueError('conflicting level / dimension names. {} '
+                                 'already exists as a level name.'.format(d))

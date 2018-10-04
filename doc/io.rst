@@ -295,7 +295,7 @@ string encoding for character arrays in netCDF files was
 Technically, you can use
 `any string encoding recognized by Python <https://docs.python.org/3/library/codecs.html#standard-encodings>`_ if you feel the need to deviate from UTF-8,
 by setting the ``_Encoding`` field in ``encoding``. But
-`we don't recommend it<http://utf8everywhere.org/>`_.
+`we don't recommend it <http://utf8everywhere.org/>`_.
 
 .. warning::
 
@@ -337,6 +337,38 @@ supported by netCDF4-python: 'standard', 'gregorian', 'proleptic_gregorian' 'nol
 
 By default, xarray uses the 'proleptic_gregorian' calendar and units of the smallest time
 difference between values, with a reference time of the first time value.
+
+.. _io.iris:
+
+Iris
+----
+
+The Iris_ tool allows easy reading of common meteorological and climate model formats
+(including GRIB and UK MetOffice PP files) into ``Cube`` objects which are in many ways very
+similar to ``DataArray`` objects, while enforcing a CF-compliant data model. If iris is
+installed xarray can convert a ``DataArray`` into a ``Cube`` using
+:py:meth:`~xarray.DataArray.to_iris`:
+
+.. ipython:: python
+
+    da = xr.DataArray(np.random.rand(4, 5), dims=['x', 'y'],
+                      coords=dict(x=[10, 20, 30, 40],
+                                  y=pd.date_range('2000-01-01', periods=5)))
+
+    cube = da.to_iris()
+    cube
+
+Conversely, we can create a new ``DataArray`` object from a ``Cube`` using
+:py:meth:`~xarray.DataArray.from_iris`:
+
+.. ipython:: python
+
+    da_cube = xr.DataArray.from_iris(cube)
+    da_cube
+
+
+.. _Iris: http://scitools.org.uk/iris
+
 
 OPeNDAP
 -------
@@ -480,10 +512,14 @@ rasterio is installed. Here is an example of how to use
     [1703814 values with dtype=uint8]
     Coordinates:
       * band     (band) int64 1 2 3
-      * y        (y) float64 2.827e+06 2.827e+06 2.826e+06 2.826e+06 2.826e+06 ...
-      * x        (x) float64 1.02e+05 1.023e+05 1.026e+05 1.029e+05 1.032e+05 ...
+      * y        (y) float64 2.827e+06 2.826e+06 2.826e+06 2.826e+06 2.826e+06 ...
+      * x        (x) float64 1.021e+05 1.024e+05 1.027e+05 1.03e+05 1.033e+05 ...
     Attributes:
-        crs:      +init=epsg:32618
+        res:        (300.0379266750948, 300.041782729805)
+        transform:  (300.0379266750948, 0.0, 101985.0, 0.0, -300.041782729805, 28...
+        is_tiled:   0
+        crs:        +init=epsg:32618
+
 
 The ``x`` and ``y`` coordinates are generated out of the file's metadata
 (``bounds``, ``width``, ``height``), and they can be understood as cartesian
@@ -498,9 +534,106 @@ longitudes and latitudes.
     considered as being experimental. Please report any bug you may find
     on xarray's github repository.
 
-.. _rasterio: https://mapbox.github.io/rasterio/
+.. _rasterio: https://rasterio.readthedocs.io/en/latest/
 .. _test files: https://github.com/mapbox/rasterio/blob/master/tests/data/RGB.byte.tif
 .. _pyproj: https://github.com/jswhit/pyproj
+
+.. _io.zarr:
+
+Zarr
+----
+
+`Zarr`_ is a Python package providing an implementation of chunked, compressed,
+N-dimensional arrays.
+Zarr has the ability to store arrays in a range of ways, including in memory,
+in files, and in cloud-based object storage such as `Amazon S3`_ and
+`Google Cloud Storage`_.
+Xarray's Zarr backend allows xarray to leverage these capabilities.
+
+.. warning::
+
+    Zarr support is still an experimental feature. Please report any bugs or
+    unexepected behavior via github issues.
+
+Xarray can't open just any zarr dataset, because xarray requires special
+metadata (attributes) describing the dataset dimensions and coordinates.
+At this time, xarray can only open zarr datasets that have been written by
+xarray. To write a dataset with zarr, we use the
+:py:attr:`Dataset.to_zarr <xarray.Dataset.to_zarr>` method.
+To write to a local directory, we pass a path to a directory
+
+.. ipython:: python
+   :suppress:
+
+    ! rm -rf path/to/directory.zarr
+
+.. ipython:: python
+
+    ds = xr.Dataset({'foo': (('x', 'y'), np.random.rand(4, 5))},
+                    coords={'x': [10, 20, 30, 40],
+                            'y': pd.date_range('2000-01-01', periods=5),
+                            'z': ('x', list('abcd'))})
+    ds.to_zarr('path/to/directory.zarr')
+
+(The suffix ``.zarr`` is optional--just a reminder that a zarr store lives
+there.) If the directory does not exist, it will be created. If a zarr
+store is already present at that path, an error will be raised, preventing it
+from being overwritten. To override this behavior and overwrite an existing
+store, add ``mode='w'`` when invoking ``to_zarr``.
+
+To read back a zarr dataset that has been created this way, we use the
+:py:func:`~xarray.open_zarr` method:
+
+.. ipython:: python
+
+    ds_zarr = xr.open_zarr('path/to/directory.zarr')
+    ds_zarr
+
+Cloud Storage Buckets
+~~~~~~~~~~~~~~~~~~~~~
+
+It is possible to read and write xarray datasets directly from / to cloud
+storage buckets using zarr. This example uses the `gcsfs`_ package to provide
+a ``MutableMapping`` interface to `Google Cloud Storage`_, which we can then
+pass to xarray::
+
+    import gcsfs
+    fs = gcsfs.GCSFileSystem(project='<project-name>', token=None)
+    gcsmap = gcsfs.mapping.GCSMap('<bucket-name>', gcs=fs, check=True, create=False)
+    # write to the bucket
+    ds.to_zarr(store=gcsmap)
+    # read it back
+    ds_gcs = xr.open_zarr(gcsmap)
+
+.. _Zarr: http://zarr.readthedocs.io/
+.. _Amazon S3: https://aws.amazon.com/s3/
+.. _Google Cloud Storage: https://cloud.google.com/storage/
+.. _gcsfs: https://github.com/dask/gcsfs
+
+Zarr Compressors and Filters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+There are many different options for compression and filtering possible with
+zarr. These are described in the
+`zarr documentation <http://zarr.readthedocs.io/en/stable/tutorial.html#compressors>`_.
+These options can be passed to the ``to_zarr`` method as variable encoding.
+For example:
+
+.. ipython:: python
+   :suppress:
+
+    ! rm -rf foo.zarr
+
+.. ipython:: python
+
+    import zarr
+    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+    ds.to_zarr('foo.zarr', encoding={'foo': {'compressor': compressor}})
+
+.. note::
+
+    Not all native zarr compression and filtering options have been tested with
+    xarray.
 
 .. _io.pynio:
 
@@ -517,7 +650,26 @@ We recommend installing PyNIO via conda::
 
 .. _PyNIO: https://www.pyngl.ucar.edu/Nio.shtml
 
-.. _combining multiple files:
+.. _io.PseudoNetCDF:
+
+Formats supported by PseudoNetCDF
+---------------------------------
+
+xarray can also read CAMx, BPCH, ARL PACKED BIT, and many other file
+formats supported by PseudoNetCDF_, if PseudoNetCDF is installed. 
+PseudoNetCDF can also provide Climate Forecasting Conventions to
+CMAQ files. In addition, PseudoNetCDF can automatically register custom
+readers that subclass PseudoNetCDF.PseudoNetCDFFile. PseudoNetCDF can
+identify readers heuristically, or format can be specified via a key in
+`backend_kwargs`.
+
+To use PseudoNetCDF to read such files, supply
+``engine='pseudonetcdf'`` to :py:func:`~xarray.open_dataset`.
+
+Add ``backend_kwargs={'format': '<format name>'}`` where `<format name>`
+options are listed on the PseudoNetCDF page.
+
+.. _PseudoNetCDF: http://github.com/barronh/PseudoNetCDF
 
 
 Formats supported by Pandas
@@ -529,6 +681,9 @@ exporting your objects to pandas and using its broad range of `IO tools`_.
 .. _IO tools: http://pandas.pydata.org/pandas-docs/stable/io.html
 
 
+.. _combining multiple files:
+
+
 Combining multiple files
 ------------------------
 
@@ -538,9 +693,9 @@ files into a single Dataset by making use of :py:func:`~xarray.concat`.
 
 .. note::
 
-    Version 0.5 includes support for manipulating datasets that
-    don't fit into memory with dask_. If you have dask installed, you can open
-    multiple files simultaneously using :py:func:`~xarray.open_mfdataset`::
+    Xarray includes support for manipulating datasets that don't fit into memory
+    with dask_. If you have dask installed, you can open multiple files
+    simultaneously using :py:func:`~xarray.open_mfdataset`::
 
         xr.open_mfdataset('my/files/*.nc')
 

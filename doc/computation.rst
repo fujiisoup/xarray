@@ -59,8 +59,9 @@ Missing values
 
 xarray objects borrow the :py:meth:`~xarray.DataArray.isnull`,
 :py:meth:`~xarray.DataArray.notnull`, :py:meth:`~xarray.DataArray.count`,
-:py:meth:`~xarray.DataArray.dropna` and :py:meth:`~xarray.DataArray.fillna` methods
-for working with missing data from pandas:
+:py:meth:`~xarray.DataArray.dropna`, :py:meth:`~xarray.DataArray.fillna`,
+:py:meth:`~xarray.DataArray.ffill`, and :py:meth:`~xarray.DataArray.bfill`
+methods for working with missing data from pandas:
 
 .. ipython:: python
 
@@ -70,9 +71,24 @@ for working with missing data from pandas:
     x.count()
     x.dropna(dim='x')
     x.fillna(-1)
+    x.ffill('x')
+    x.bfill('x')
 
 Like pandas, xarray uses the float value ``np.nan`` (not-a-number) to represent
 missing values.
+
+xarray objects also have an :py:meth:`~xarray.DataArray.interpolate_na` method
+for filling missing values via 1D interpolation.
+
+.. ipython:: python
+
+    x = xr.DataArray([0, 1, np.nan, np.nan, 2], dims=['x'],
+                     coords={'xx': xr.Variable('x', [0, 1, 1.1, 1.9, 3])})
+    x.interpolate_na(dim='x', method='linear', use_coordinate='xx')
+
+Note that xarray slightly diverges from the pandas ``interpolate`` syntax by
+providing the ``use_coordinate`` keyword which facilitates a clear specification
+of which values to use as the index in the interpolation.
 
 Aggregation
 ===========
@@ -142,19 +158,72 @@ Aggregation and summary methods can be applied directly to the ``Rolling`` objec
     r.mean()
     r.reduce(np.std)
 
-Note that rolling window aggregations are much faster (both asymptotically and
-because they avoid a loop in Python) when bottleneck_ is installed. Otherwise,
-we fall back to a slower, pure Python implementation.
+Note that rolling window aggregations are faster when bottleneck_ is installed.
 
 .. _bottleneck: https://github.com/kwgoodman/bottleneck/
 
-Finally, we can manually iterate through ``Rolling`` objects:
+We can also manually iterate through ``Rolling`` objects:
 
 .. ipython:: python
 
    @verbatim
    for label, arr_window in r:
       # arr_window is a view of x
+
+Finally, the rolling object has a ``construct`` method which returns a
+view of the original ``DataArray`` with the windowed dimension in
+the last position.
+You can use this for more advanced rolling operations such as strided rolling,
+windowed rolling, convolution, short-time FFT etc.
+
+.. ipython:: python
+
+    # rolling with 2-point stride
+    rolling_da = r.construct('window_dim', stride=2)
+    rolling_da
+    rolling_da.mean('window_dim', skipna=False)
+
+Because the ``DataArray`` given by ``r.construct('window_dim')`` is a view
+of the original array, it is memory efficient.
+You can also use ``construct`` to compute a weighted rolling sum:
+
+.. ipython:: python
+
+   weight = xr.DataArray([0.25, 0.5, 0.25], dims=['window'])
+   arr.rolling(y=3).construct('window').dot(weight)
+
+.. note::
+  numpy's Nan-aggregation functions such as ``nansum`` copy the original array.
+  In xarray, we internally use these functions in our aggregation methods
+  (such as ``.sum()``) if ``skipna`` argument is not specified or set to True.
+  This means ``rolling_da.mean('window_dim')`` is memory inefficient.
+  To avoid this, use ``skipna=False`` as the above example.
+
+
+Computation using Coordinates
+=============================
+
+Xarray objects have some handy methods for the computation with their
+coordinates. :py:meth:`~xarray.DataArray.differentiate` computes derivatives by
+central finite differences using their coordinates,
+
+.. ipython:: python
+
+    a = xr.DataArray([0, 1, 2, 3], dims=['x'], coords=[[0.1, 0.11, 0.2, 0.3]])
+    a
+    a.differentiate('x')
+
+This method can be used also for multidimensional arrays,
+
+.. ipython:: python
+
+    a = xr.DataArray(np.arange(8).reshape(4, 2), dims=['x', 'y'],
+                     coords={'x': [0.1, 0.11, 0.2, 0.3]})
+    a.differentiate('x')
+
+.. note::
+    This method is limited to simple cartesian geometry. Differentiation along
+    multidimensional coordinate is not supported.
 
 .. _compute.broadcasting:
 
@@ -303,20 +372,14 @@ Datasets support most of the same methods found on data arrays:
     ds.mean(dim='x')
     abs(ds)
 
-Unfortunately, we currently do not support NumPy ufuncs for datasets [1]_.
-:py:meth:`~xarray.Dataset.apply` works around this
-limitation, by applying the given function to each variable in the dataset:
+Datasets also support NumPy ufuncs (requires NumPy v1.13 or newer), or
+alternatively you can use :py:meth:`~xarray.Dataset.apply` to apply a function
+to each variable in a dataset:
 
 .. ipython:: python
 
+    np.sin(ds)
     ds.apply(np.sin)
-
-You can also use the wrapped functions in the ``xarray.ufuncs`` module:
-
-.. ipython:: python
-
-    import xarray.ufuncs as xu
-    xu.sin(ds)
 
 Datasets also use looping over variables for *broadcasting* in binary
 arithmetic. You can do arithmetic between any ``DataArray`` and a dataset:
@@ -335,10 +398,6 @@ Arithmetic between two datasets matches data variables of the same name:
 Similarly to index based alignment, the result has the intersection of all
 matching data variables.
 
-.. [1] This was previously due to a limitation of NumPy, but with NumPy 1.13
-       we should be able to support this by leveraging ``__array_ufunc__``
-       (:issue:`1617`).
-
 .. _comput.wrapping-custom:
 
 Wrapping custom computation
@@ -350,7 +409,7 @@ It doesn't always make sense to do computation directly with xarray objects:
     considerable overhead compared to using NumPy or native Python types.
     This is particularly true when working with scalars or small arrays (less
     than ~1e6 elements). Keeping track of labels and ensuring their consistency
-    adds overhead, and array's core itself is not especially fast, because it's
+    adds overhead, and xarray's core itself is not especially fast, because it's
     written in Python rather than a compiled language like C. Also, xarray's
     high level label-based APIs removes low-level control over how operations
     are implemented.

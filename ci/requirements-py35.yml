@@ -3,11 +3,11 @@ channels:
   - conda-forge
 dependencies:
   - python=3.5
-  - dask
-  - distributed
+  - cftime
+  - dask=0.16
   - h5py
   - h5netcdf
-  - matplotlib
+  - matplotlib=1.5
   - netcdf4
   - pytest
   - flake8
@@ -17,6 +17,7 @@ dependencies:
   - seaborn
   - toolz
   - rasterio
+  - zarr
   - pip:
     - coveralls
     - pytest-cov
